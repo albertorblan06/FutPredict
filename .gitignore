@@ -1,0 +1,70 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Data and Machine Learning Models
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+*.dat
+*.pt
+*.pth
+*.h5
+*.hdf5
+*.pkl
+*.joblib
+*.json
+!package.json
+!skills.json
+data/
+cache/
+logs/
+batch_results.txt
+tests.txt
+
+# macOS / OS specific
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
