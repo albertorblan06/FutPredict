@@ -23,10 +23,54 @@ from scipy.stats import nbinom
 from .config import (LSTM_HIDDEN, LSTM_LAYERS, LSTM_SEQ_LEN, LSTM_EMBED_DIM,
                      LSTM_LR, LSTM_EPOCHS, LSTM_BATCH, LSTM_PATIENCE,
                      LSTM_TRAIN_START, LSTM_MODEL_PATH, LSTM_META_PATH,
-                     MAX_GOALS, TRAIN_END_DATE)
+                     LSTM_CONS_MODEL_PATH, LSTM_CONS_META_PATH,
+                     MAX_GOALS, TRAIN_END_DATE,
+                     FOCAL_ALPHA, FOCAL_GAMMA)
+from .focal_loss import FocalLoss
 from .rankings import get_fifa_rank, get_fifa_points, get_median_fifa
 from .analysis import get_tournament_weight
 from .statistical_model import build_score_matrix
+
+
+def _to_ordinal_target(goal_class, n_classes=10):
+    """Convert integer goal count to cumulative ordinal vector.
+    
+    If a team scores 3 goals, the target is [1, 1, 1, 0, 0, 0, 0, 0, 0, 0].
+    This encodes the ordinal structure: to score 3, you first score 1 and 2.
+    """
+    target = torch.zeros(n_classes)
+    target[:goal_class] = 1.0
+    return target
+
+
+def _ordinal_targets_batch(goal_classes, n_classes=10):
+    """Convert a batch of integer goal counts to ordinal target matrix."""
+    batch_size = goal_classes.shape[0]
+    targets = torch.zeros(batch_size, n_classes)
+    for i in range(batch_size):
+        g = int(goal_classes[i].item())
+        targets[i, :g] = 1.0
+    return targets
+
+
+def _ordinal_logits_to_pmf(logits):
+    """Convert ordinal cumulative logits to discrete goal PMF.
+    
+    P(goals >= k) = sigmoid(logit_k)
+    P(goals = k) = P(goals >= k) - P(goals >= k+1)
+    """
+    probs_ge = torch.sigmoid(logits)  # P(goals >= k) for k=0..9
+    # P(goals = k) = P(goals >= k) - P(goals >= k+1)
+    # For the last class: P(goals = 9) = P(goals >= 9)
+    pmf = torch.zeros_like(probs_ge)
+    for k in range(probs_ge.shape[-1] - 1):
+        pmf[..., k] = probs_ge[..., k] - probs_ge[..., k + 1]
+    pmf[..., -1] = probs_ge[..., -1]
+    # Clamp to avoid negative probabilities from numerical imprecision
+    pmf = torch.clamp(pmf, min=1e-8)
+    # Normalize
+    pmf = pmf / pmf.sum(dim=-1, keepdim=True)
+    return pmf
 
 # ═══════════════════════════════════════════════════════════════
 #  MODEL ARCHITECTURE
@@ -115,9 +159,9 @@ class GoalCountNet(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # Output heads for 10 classes (0 to 9 goals)
-        self.home_goals_head = nn.Linear(64, 10)
-        self.away_goals_head = nn.Linear(64, 10)
+        # Output heads for Poisson regression (log lambda)
+        self.home_goals_head = nn.Linear(64, 1)
+        self.away_goals_head = nn.Linear(64, 1)
 
     def forward(self, seq_a, seq_b, team_a_idx, team_b_idx, context):
         _, (h_a, _) = self.lstm(seq_a)
@@ -335,56 +379,57 @@ class MatchDataset(torch.utils.data.Dataset):
 
 def train_lstm_mdn(conn, force=False):
     """
-    Train or load cached LSTM+MDN model.
-
-    Returns: (model, team_idx, meta) or (None, None, None) on failure
+    Train or load cached dual LSTM+MDN models (Aggressive and Conservative).
     """
-    # Ensure deterministic training
     torch.manual_seed(42)
     np.random.seed(42)
 
-    if not force and os.path.exists(LSTM_MODEL_PATH) and os.path.exists(LSTM_META_PATH):
+    if not force and os.path.exists(LSTM_MODEL_PATH) and os.path.exists(LSTM_META_PATH) and os.path.exists(LSTM_CONS_MODEL_PATH) and os.path.exists(LSTM_CONS_META_PATH):
         try:
             with open(LSTM_META_PATH, "r") as f:
-                meta = json.load(f)
-            team_idx = meta.get("team_idx", {})
-            n_teams = meta.get("n_teams", 500)
-            print("   [DEBUG] Initializing FootballClassifier and GoalCountNet...")
-            model = FootballClassifier(
-                seq_feature_dim=len(SEQ_FEATURES),
-                context_dim=6,
-                n_teams=n_teams,
-                hidden_size=LSTM_HIDDEN,
-                num_layers=LSTM_LAYERS,
-                embed_dim=LSTM_EMBED_DIM,
-                dropout=LSTM_DROPOUT,
+                meta_agg = json.load(f)
+            with open(LSTM_CONS_META_PATH, "r") as f:
+                meta_cons = json.load(f)
+                
+            team_idx = meta_agg.get("team_idx", {})
+            n_teams = meta_agg.get("n_teams", 500)
+            
+            print("   [DEBUG] Initializing Dual FootballClassifiers and GoalCountNet...")
+            device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+            
+            model_agg = FootballClassifier(
+                seq_feature_dim=len(SEQ_FEATURES), context_dim=6, n_teams=n_teams,
+                hidden_size=LSTM_HIDDEN, num_layers=LSTM_LAYERS,
+                embed_dim=LSTM_EMBED_DIM, dropout=LSTM_DROPOUT,
+            )
+            model_cons = FootballClassifier(
+                seq_feature_dim=len(SEQ_FEATURES), context_dim=6, n_teams=n_teams,
+                hidden_size=LSTM_HIDDEN, num_layers=LSTM_LAYERS,
+                embed_dim=LSTM_EMBED_DIM, dropout=LSTM_DROPOUT,
             )
             model_goals = GoalCountNet(
-                seq_feature_dim=len(SEQ_FEATURES),
-                context_dim=6,
-                n_teams=n_teams,
-                hidden_size=LSTM_HIDDEN,
-                num_layers=LSTM_LAYERS,
-                embed_dim=LSTM_EMBED_DIM,
-                dropout=LSTM_DROPOUT,
+                seq_feature_dim=len(SEQ_FEATURES), context_dim=6, n_teams=n_teams,
+                hidden_size=LSTM_HIDDEN, num_layers=LSTM_LAYERS,
+                embed_dim=LSTM_EMBED_DIM, dropout=LSTM_DROPOUT,
             )
-            device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-            model.to(device)
+            
+            model_agg.to(device)
+            model_cons.to(device)
             model_goals.to(device)
-            print("   [DEBUG] Loading state dict from disk...")
-            model.load_state_dict(torch.load(LSTM_MODEL_PATH, map_location=device))
+            
+            model_agg.load_state_dict(torch.load(LSTM_MODEL_PATH, map_location=device))
+            model_cons.load_state_dict(torch.load(LSTM_CONS_MODEL_PATH, map_location=device))
             
             goals_path = LSTM_MODEL_PATH.replace(".pt", "_goals.pt")
             if os.path.exists(goals_path):
                 model_goals.load_state_dict(torch.load(goals_path, map_location=device))
                 
-            print("   [DEBUG] State dict loaded. Setting eval mode...")
-            model.eval()
+            model_agg.eval()
+            model_cons.eval()
             model_goals.eval()
-            print(f"   ✓  Loaded cached LSTM+MDN ({meta.get('n_train', '?')} "
-                  f"training samples)\n"
-                  f"      Val NLL: {meta.get('val_nll', 0):.4f}")
-            return model, model_goals, team_idx, meta
+            
+            print(f"   ✓  Loaded dual LSTM+MDN models ({meta_agg.get('n_train', '?')} training samples)")
+            return model_agg, model_cons, model_goals, team_idx, meta_agg, meta_cons
         except Exception as e:
             print(f"   ⚠  Cache load failed ({e}), retraining...")
 
@@ -393,125 +438,59 @@ def train_lstm_mdn(conn, force=False):
         samples, team_idx = _build_training_data(conn)
     except Exception as e:
         print(f"   ✗  Sequence building failed: {e}")
-        return None, None, None
+        return None, None, None, None, None, None
 
     if len(samples) < 2000:
         print(f"   ✗  Not enough data ({len(samples)} samples)")
-        return None, None, None
+        return None, None, None, None, None, None
 
     n_teams = max(team_idx.values()) + 1
-    print(f"   ✓  {len(samples):,} match sequences built "
-          f"({n_teams} teams, {LSTM_SEQ_LEN} steps)")
+    print(f"   ✓  {len(samples):,} match sequences built ({n_teams} teams, {LSTM_SEQ_LEN} steps)")
 
-    # Walk-forward split
     split = int(len(samples) * 0.85)
     train_data = MatchDataset(samples[:split])
     val_data = MatchDataset(samples[split:])
 
-    train_loader = torch.utils.data.DataLoader(
-        train_data, batch_size=LSTM_BATCH, shuffle=True, drop_last=True)
-    val_loader = torch.utils.data.DataLoader(
-        val_data, batch_size=LSTM_BATCH, shuffle=False)
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=LSTM_BATCH, shuffle=True, drop_last=True)
+    val_loader = torch.utils.data.DataLoader(val_data, batch_size=LSTM_BATCH, shuffle=False)
 
-    # Define device for hardware acceleration (Apple Silicon MPS or CPU)
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
-    model = FootballClassifier(
-        seq_feature_dim=len(SEQ_FEATURES),
-        context_dim=6,
-        n_teams=n_teams,
-        hidden_size=LSTM_HIDDEN,
-        num_layers=LSTM_LAYERS,
-        embed_dim=LSTM_EMBED_DIM,
-        dropout=LSTM_DROPOUT,
-    )
-    model_goals = GoalCountNet(
-        seq_feature_dim=len(SEQ_FEATURES),
-        context_dim=6,
-        n_teams=n_teams,
-        hidden_size=LSTM_HIDDEN,
-        num_layers=LSTM_LAYERS,
-        embed_dim=LSTM_EMBED_DIM,
-        dropout=LSTM_DROPOUT,
-    )
-    model.to(device)
-    model_goals.to(device)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LSTM_LR,
-                                  weight_decay=1e-4)
-    optimizer_goals = torch.optim.AdamW(model_goals.parameters(), lr=LSTM_LR,
-                                        weight_decay=1e-3)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=10, T_mult=2, eta_min=1e-5)
-    scheduler_goals = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer_goals, T_0=10, T_mult=2, eta_min=1e-5)
-
-    print(f"   ⚙  Training LSTM+MDN & GoalCountNet ({LSTM_EPOCHS} epochs, "
-          f"batch={LSTM_BATCH})...")
-
-    best_val_loss = float("inf")
-    patience_counter = 0
-    best_state = None
-    best_state_goals = None
-
-    for epoch in range(LSTM_EPOCHS):
-        # Training
-        model.train()
-        model_goals.train()
-        train_loss = 0.0
-        train_loss_goals = 0.0
-        n_batches = 0
-        for batch in train_loader:
-            seq_a = batch["seq_a"].to(device)
-            seq_b = batch["seq_b"].to(device)
-            t_a_idx = batch["team_a_idx"].squeeze(1).to(device)
-            t_b_idx = batch["team_b_idx"].squeeze(1).to(device)
-            ctx = batch["context"].to(device)
-            h_g = batch["home_goals"].squeeze(1).to(device)
-            a_g = batch["away_goals"].squeeze(1).to(device)
-
-            outcomes = torch.where(h_g > a_g, 0, torch.where(h_g == a_g, 1, 2)).long()
+    def _train_single_model(is_aggressive):
+        model = FootballClassifier(
+            seq_feature_dim=len(SEQ_FEATURES), context_dim=6, n_teams=n_teams,
+            hidden_size=LSTM_HIDDEN, num_layers=LSTM_LAYERS,
+            embed_dim=LSTM_EMBED_DIM, dropout=LSTM_DROPOUT,
+        )
+        model.to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LSTM_LR, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-5)
+        
+        if is_aggressive:
+            model_goals = GoalCountNet(
+                seq_feature_dim=len(SEQ_FEATURES), context_dim=6, n_teams=n_teams,
+                hidden_size=LSTM_HIDDEN, num_layers=LSTM_LAYERS,
+                embed_dim=LSTM_EMBED_DIM, dropout=LSTM_DROPOUT,
+            )
+            model_goals.to(device)
+            optimizer_goals = torch.optim.AdamW(model_goals.parameters(), lr=LSTM_LR, weight_decay=1e-3)
+            scheduler_goals = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer_goals, T_0=10, T_mult=2, eta_min=1e-5)
+        else:
+            model_goals = None
             
-            # Clamp goals to max 9 for discrete classification
-            h_g_class = torch.clamp(h_g.long(), 0, 9)
-            a_g_class = torch.clamp(a_g.long(), 0, 9)
-
-            logits = model(seq_a, seq_b, t_a_idx, t_b_idx, ctx)
-            h_logits, a_logits = model_goals(seq_a, seq_b, t_a_idx, t_b_idx, ctx)
+        best_val_loss = float("inf")
+        patience_counter = 0
+        best_state = None
+        best_state_goals = None
+        
+        for epoch in range(LSTM_EPOCHS):
+            model.train()
+            if model_goals: model_goals.train()
+            train_loss = 0.0
+            train_loss_goals = 0.0
+            n_batches = 0
             
-            criterion = nn.CrossEntropyLoss()
-            loss = criterion(logits, outcomes)
-            loss_goals = criterion(h_logits, h_g_class) + criterion(a_logits, a_g_class)
-            
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            
-            optimizer_goals.zero_grad()
-            loss_goals.backward()
-            torch.nn.utils.clip_grad_norm_(model_goals.parameters(), 1.0)
-            optimizer_goals.step()
-            
-            train_loss += loss.item()
-            train_loss_goals += loss_goals.item()
-            n_batches += 1
-            
-            if n_batches % 50 == 0:
-                print(".", end="", flush=True)
-        print()
-
-        avg_train = train_loss / max(n_batches, 1)
-        avg_train_goals = train_loss_goals / max(n_batches, 1)
-
-        # Validation
-        model.eval()
-        model_goals.eval()
-        val_loss = 0.0
-        val_loss_goals = 0.0
-        n_val = 0
-        with torch.no_grad():
-            for batch in val_loader:
+            for batch in train_loader:
                 seq_a = batch["seq_a"].to(device)
                 seq_b = batch["seq_b"].to(device)
                 t_a_idx = batch["team_a_idx"].squeeze(1).to(device)
@@ -519,77 +498,236 @@ def train_lstm_mdn(conn, force=False):
                 ctx = batch["context"].to(device)
                 h_g = batch["home_goals"].squeeze(1).to(device)
                 a_g = batch["away_goals"].squeeze(1).to(device)
+                
                 outcomes = torch.where(h_g > a_g, 0, torch.where(h_g == a_g, 1, 2)).long()
                 
-                h_g_class = torch.clamp(h_g.long(), 0, 9)
-                a_g_class = torch.clamp(a_g.long(), 0, 9)
-
                 logits = model(seq_a, seq_b, t_a_idx, t_b_idx, ctx)
-                h_logits, a_logits = model_goals(seq_a, seq_b, t_a_idx, t_b_idx, ctx)
                 
-                loss = criterion(logits, outcomes)
-                loss_goals = criterion(h_logits, h_g_class) + criterion(a_logits, a_g_class)
+                if is_aggressive:
+                    criterion_1x2 = FocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA)
+                    loss = criterion_1x2(logits, outcomes)
+                else:
+                    criterion_1x2 = nn.CrossEntropyLoss()
+                    ce_loss = criterion_1x2(logits, outcomes)
+                    # Entropy Minimization to force sharpness
+                    probs = torch.softmax(logits, dim=-1)
+                    entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1).mean()
+                    loss = ce_loss + 0.25 * entropy
                 
-                val_loss += loss.item()
-                val_loss_goals += loss_goals.item()
-                n_val += 1
-
-        avg_val = val_loss / max(n_val, 1)
-        avg_val_goals = val_loss_goals / max(n_val, 1)
-        scheduler.step()
-        scheduler_goals.step()
-
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"      Epoch {epoch+1:3d}/{LSTM_EPOCHS}: "
-                  f"train={avg_train:.4f}, val={avg_val:.4f} "
-                  f"| goals_train={avg_train_goals:.4f}, goals_val={avg_val_goals:.4f}")
-
-        # Use 1X2 val_loss for early stopping
-        if avg_val < best_val_loss:
-            best_val_loss = avg_val
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
-            best_state_goals = {k: v.clone() for k, v in model_goals.state_dict().items()}
-            patience_counter = 0
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                train_loss += loss.item()
+                
+                if model_goals:
+                    h_g_target = torch.clamp(h_g.float(), 0, 9).unsqueeze(1)
+                    a_g_target = torch.clamp(a_g.float(), 0, 9).unsqueeze(1)
+                    h_logits, a_logits = model_goals(seq_a, seq_b, t_a_idx, t_b_idx, ctx)
+                    criterion_goals = nn.PoissonNLLLoss(log_input=True)
+                    loss_goals = criterion_goals(h_logits, h_g_target) + criterion_goals(a_logits, a_g_target)
+                    
+                    optimizer_goals.zero_grad()
+                    loss_goals.backward()
+                    torch.nn.utils.clip_grad_norm_(model_goals.parameters(), 1.0)
+                    optimizer_goals.step()
+                    train_loss_goals += loss_goals.item()
+                    
+                n_batches += 1
+                if n_batches % 50 == 0:
+                    print(".", end="", flush=True)
+            print()
+            
+            avg_train = train_loss / max(n_batches, 1)
+            avg_train_goals = train_loss_goals / max(n_batches, 1)
+            
+            # Validation
+            model.eval()
+            if model_goals: model_goals.eval()
+            val_loss = 0.0
+            val_loss_goals = 0.0
+            n_val = 0
+            
+            with torch.no_grad():
+                for batch in val_loader:
+                    seq_a = batch["seq_a"].to(device)
+                    seq_b = batch["seq_b"].to(device)
+                    t_a_idx = batch["team_a_idx"].squeeze(1).to(device)
+                    t_b_idx = batch["team_b_idx"].squeeze(1).to(device)
+                    ctx = batch["context"].to(device)
+                    h_g = batch["home_goals"].squeeze(1).to(device)
+                    a_g = batch["away_goals"].squeeze(1).to(device)
+                    outcomes = torch.where(h_g > a_g, 0, torch.where(h_g == a_g, 1, 2)).long()
+                    
+                    logits = model(seq_a, seq_b, t_a_idx, t_b_idx, ctx)
+                    
+                    if is_aggressive:
+                        criterion_1x2 = FocalLoss(alpha=FOCAL_ALPHA, gamma=FOCAL_GAMMA)
+                        loss = criterion_1x2(logits, outcomes)
+                    else:
+                        criterion_1x2 = nn.CrossEntropyLoss()
+                        ce_loss = criterion_1x2(logits, outcomes)
+                        probs = torch.softmax(logits, dim=-1)
+                        entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1).mean()
+                        loss = ce_loss + 0.25 * entropy
+                        
+                    val_loss += loss.item()
+                    
+                    if model_goals:
+                        h_g_target = torch.clamp(h_g.float(), 0, 9).unsqueeze(1)
+                        a_g_target = torch.clamp(a_g.float(), 0, 9).unsqueeze(1)
+                        h_logits, a_logits = model_goals(seq_a, seq_b, t_a_idx, t_b_idx, ctx)
+                        criterion_goals = nn.PoissonNLLLoss(log_input=True)
+                        loss_goals = criterion_goals(h_logits, h_g_target) + criterion_goals(a_logits, a_g_target)
+                        val_loss_goals += loss_goals.item()
+                        
+                    n_val += 1
+            
+            avg_val = val_loss / max(n_val, 1)
+            avg_val_goals = val_loss_goals / max(n_val, 1)
+            
+            scheduler.step()
+            if model_goals: scheduler_goals.step()
+            
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                print(f"      Epoch {epoch+1:3d}/{LSTM_EPOCHS}: train={avg_train:.4f}, val={avg_val:.4f}" + 
+                      (f" | goals_train={avg_train_goals:.4f}, goals_val={avg_val_goals:.4f}" if model_goals else ""))
+                
+            if avg_val < best_val_loss:
+                best_val_loss = avg_val
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+                if model_goals:
+                    best_state_goals = {k: v.clone() for k, v in model_goals.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= LSTM_PATIENCE:
+                    print(f"      Early stopping at epoch {epoch+1}")
+                    break
+                    
+        # Load best state
+        if best_state: model.load_state_dict(best_state)
+        model.eval()
+        if model_goals and best_state_goals:
+            model_goals.load_state_dict(best_state_goals)
+            model_goals.eval()
+            
+        if is_aggressive:
+            learned_temp = _calibrate_temperature(model, val_loader, device)
+            print(f"   ✓  Platt Scaling: learned T* = {learned_temp:.4f}")
         else:
-            patience_counter += 1
-            if patience_counter >= LSTM_PATIENCE:
-                print(f"      Early stopping at epoch {epoch+1}")
-                break
-
-    # Load best state
-    if best_state:
-        model.load_state_dict(best_state)
-    model.eval()
+            learned_temp = 1.0
+            print("   ✓  Platt Scaling: Skipped (T* = 1.0) for sharp Conservative predictions")
+        
+        meta = {
+            "n_train": split,
+            "n_val": len(samples) - split,
+            "n_teams": n_teams,
+            "val_nll": float(best_val_loss),
+            "team_idx": team_idx,
+            "trained_at": datetime.datetime.now().isoformat(),
+            "seq_len": LSTM_SEQ_LEN,
+            "hidden_size": LSTM_HIDDEN,
+            "learned_temperature": learned_temp,
+        }
+        
+        return model, model_goals, meta
+        
+    print(f"   ⚙  Training Aggressive LSTM+MDN & GoalCountNet ({LSTM_EPOCHS} epochs, batch={LSTM_BATCH})...")
+    model_agg, model_goals, meta_agg = _train_single_model(is_aggressive=True)
     
-    if best_state_goals:
-        model_goals.load_state_dict(best_state_goals)
-    model_goals.eval()
-
-    # Save
     os.makedirs(os.path.dirname(LSTM_MODEL_PATH), exist_ok=True)
-    torch.save(model.state_dict(), LSTM_MODEL_PATH)
-    
+    torch.save(model_agg.state_dict(), LSTM_MODEL_PATH)
     goals_path = LSTM_MODEL_PATH.replace(".pt", "_goals.pt")
     torch.save(model_goals.state_dict(), goals_path)
-
-    meta = {
-        "n_train": split,
-        "n_val": len(samples) - split,
-        "n_teams": n_teams,
-        "val_nll": float(best_val_loss),
-        "team_idx": team_idx,
-        "trained_at": datetime.datetime.now().isoformat(),
-        "seq_len": LSTM_SEQ_LEN,
-        "hidden_size": LSTM_HIDDEN,
-    }
     with open(LSTM_META_PATH, "w") as f:
-        json.dump(meta, f, indent=2)
+        json.dump(meta_agg, f, indent=2)
+        
+    del model_agg
+    if torch.backends.mps.is_available(): torch.mps.empty_cache()
+    
+    print(f"   ⚙  Training Conservative LSTM+MDN ({LSTM_EPOCHS} epochs, batch={LSTM_BATCH})...")
+    model_cons, _, meta_cons = _train_single_model(is_aggressive=False)
+    
+    torch.save(model_cons.state_dict(), LSTM_CONS_MODEL_PATH)
+    with open(LSTM_CONS_META_PATH, "w") as f:
+        json.dump(meta_cons, f, indent=2)
+        
+    # Reload model_agg for return
+    model_agg = FootballClassifier(
+        seq_feature_dim=len(SEQ_FEATURES), context_dim=6, n_teams=n_teams,
+        hidden_size=LSTM_HIDDEN, num_layers=LSTM_LAYERS,
+        embed_dim=LSTM_EMBED_DIM, dropout=LSTM_DROPOUT,
+    )
+    model_agg.load_state_dict(torch.load(LSTM_MODEL_PATH, map_location=device))
+    model_agg.to(device)
+    model_agg.eval()
+        
+    print(f"   ✓  LSTM+MDN Dual Models trained!")
+    return model_agg, model_cons, model_goals, team_idx, meta_agg, meta_cons
 
-    print(f"   ✓  LSTM+MDN trained! Val NLL: {best_val_loss:.4f}")
-    print(f"   ✓  GoalCountNet saved to {os.path.basename(goals_path)}")
-    print(f"   ✓  Model cached to {os.path.basename(LSTM_MODEL_PATH)}")
+class TemperatureScaler(nn.Module):
+    """Learns a single temperature parameter to calibrate logits.
+    
+    After training, the model's logits are divided by T* before softmax.
+    T* is optimized to minimize NLL on the validation set via L-BFGS.
+    This preserves top-1 accuracy while correcting probability magnitudes.
+    """
+    def __init__(self):
+        super().__init__()
+        self.temperature = nn.Parameter(torch.ones(1) * 1.5)
+    
+    def forward(self, logits):
+        return logits / self.temperature
 
-    return model, model_goals, team_idx, meta
+
+def _calibrate_temperature(model, val_loader, device):
+    """Learn optimal temperature from validation set logits.
+    
+    Returns the learned temperature as a float.
+    """
+    model.eval()
+    scaler = TemperatureScaler().to(device)
+    
+    # Collect all validation logits and targets
+    all_logits = []
+    all_targets = []
+    with torch.no_grad():
+        for batch in val_loader:
+            seq_a = batch["seq_a"].to(device)
+            seq_b = batch["seq_b"].to(device)
+            t_a_idx = batch["team_a_idx"].squeeze(1).to(device)
+            t_b_idx = batch["team_b_idx"].squeeze(1).to(device)
+            ctx = batch["context"].to(device)
+            h_g = batch["home_goals"].squeeze(1).to(device)
+            a_g = batch["away_goals"].squeeze(1).to(device)
+            outcomes = torch.where(h_g > a_g, 0, torch.where(h_g == a_g, 1, 2)).long()
+            
+            logits = model(seq_a, seq_b, t_a_idx, t_b_idx, ctx)
+            all_logits.append(logits)
+            all_targets.append(outcomes)
+    
+    all_logits = torch.cat(all_logits, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
+    
+    # Optimize temperature via L-BFGS
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.LBFGS([scaler.temperature], lr=0.01, max_iter=50)
+    
+    def closure():
+        optimizer.zero_grad()
+        scaled_logits = scaler(all_logits)
+        loss = criterion(scaled_logits, all_targets)
+        loss.backward()
+        return loss
+    
+    optimizer.step(closure)
+    
+    learned_temp = float(scaler.temperature.item())
+    # Sanity clamp: temperature should be between 0.5 and 5.0
+    learned_temp = max(0.5, min(5.0, learned_temp))
+    
+    return learned_temp
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -667,27 +805,28 @@ def _get_single_team_sequence(conn, team_name, seq_len=LSTM_SEQ_LEN, match_date=
     return seq[-seq_len:]
 
 
-def predict_lstm(model, model_goals, team_idx, conn, team_a_db, team_b_db, venue="neutral", match_date=None):
+
+def predict_lstm(model_agg, model_cons, model_goals, team_idx, conn, team_a_db, team_b_db, venue="neutral", match_date=None, meta_agg=None, meta_cons=None):
     """
     Generate a score probability matrix using the LSTM+MDN and GoalCountNet.
 
-    Returns: (score_matrix, details) or (None, None)
+    Returns: (score_matrix, details_agg, details_cons) or (None, None, None)
     """
-    if model is None or model_goals is None:
-        return None, None
+    if model_agg is None or model_cons is None or model_goals is None:
+        return None, None, None
 
     try:
         seq_a = _get_single_team_sequence(conn, team_a_db, LSTM_SEQ_LEN, match_date)
         seq_b = _get_single_team_sequence(conn, team_b_db, LSTM_SEQ_LEN, match_date)
     except Exception:
-        return None, None
+        return None, None, None
 
     feat_keys = ["gf", "ga", "opp_rank", "tournament_w", "is_home",
                   "days_gap", "result_pts", "cumulative_form",
                   "possession", "corners", "cards", "sot"]
 
     if len(seq_a) < 3 or len(seq_b) < 3:
-        return None, None
+        return None, None, None
 
     vec_a = [[s[k] for k in feat_keys] for s in seq_a]
     vec_b = [[s[k] for k in feat_keys] for s in seq_b]
@@ -718,13 +857,22 @@ def predict_lstm(model, model_goals, team_idx, conn, team_a_db, team_b_db, venue
     t_b_idx = team_idx.get(team_b_db, 0)
 
     cpu_device = torch.device('cpu')
-    model.to(cpu_device)
-    model.eval()
+    model_agg.to(cpu_device)
+    model_agg.eval()
+    model_cons.to(cpu_device)
+    model_cons.eval()
     model_goals.to(cpu_device)
     model_goals.eval()
     
     with torch.no_grad():
-        logits = model(
+        logits_agg = model_agg(
+            torch.FloatTensor([vec_a]).to(cpu_device),
+            torch.FloatTensor([vec_b]).to(cpu_device),
+            torch.LongTensor([t_a_idx]).to(cpu_device),
+            torch.LongTensor([t_b_idx]).to(cpu_device),
+            torch.FloatTensor([context]).to(cpu_device),
+        )
+        logits_cons = model_cons(
             torch.FloatTensor([vec_a]).to(cpu_device),
             torch.FloatTensor([vec_b]).to(cpu_device),
             torch.LongTensor([t_a_idx]).to(cpu_device),
@@ -739,23 +887,68 @@ def predict_lstm(model, model_goals, team_idx, conn, team_a_db, team_b_db, venue
             torch.FloatTensor([context]).to(cpu_device),
         )
         
-        # Apply Temperature Scaling to soften extreme confidence
-        T = 1.20
-        probs = torch.nn.functional.softmax(logits / T, dim=1)[0].cpu().numpy()
-        h_goals_probs = torch.nn.functional.softmax(h_goals_logits, dim=1)[0].cpu().numpy()
-        a_goals_probs = torch.nn.functional.softmax(a_goals_logits, dim=1)[0].cpu().numpy()
+        T_agg = meta_agg.get("learned_temperature", 1.20) if meta_agg else 1.20
+        probs_agg = torch.nn.functional.softmax(logits_agg / T_agg, dim=1)[0].cpu().numpy()
+        
+        T_cons = meta_cons.get("learned_temperature", 1.20) if meta_cons else 1.20
+        probs_cons = torch.nn.functional.softmax(logits_cons / T_cons, dim=1)[0].cpu().numpy()
+        
+        from scipy.stats import poisson
+        lambda_h = torch.exp(h_goals_logits).item()
+        lambda_a = torch.exp(a_goals_logits).item()
+        
+        h_goals_pmf = poisson.pmf(np.arange(10), lambda_h)
+        a_goals_pmf = poisson.pmf(np.arange(10), lambda_a)
 
-    # Generate 10x10 score matrix for GoalCountNet
-    score_matrix = np.outer(h_goals_probs, a_goals_probs)
+    score_matrix = np.outer(h_goals_pmf, a_goals_pmf)
+    
+    # Apply Dixon-Coles ρ correction to fix independence assumption
+    # ρ = -0.04 is the empirical value for international football
+    # This corrects P(0-0), P(1-0), P(0-1), P(1-1) for goal correlation
+    rho_dc = -0.04
+    mu_h = float(np.sum(np.arange(len(h_goals_pmf)) * h_goals_pmf))
+    mu_a = float(np.sum(np.arange(len(a_goals_pmf)) * a_goals_pmf))
+    if mu_h > 0.01 and mu_a > 0.01:  # guard against degenerate PMFs
+        score_matrix[0, 0] *= max(0.01, 1 - mu_h * mu_a * rho_dc)
+        score_matrix[0, 1] *= max(0.01, 1 + mu_h * rho_dc)
+        score_matrix[1, 0] *= max(0.01, 1 + mu_a * rho_dc)
+        score_matrix[1, 1] *= max(0.01, 1 - rho_dc)
+        # Re-normalize
+        score_matrix = np.clip(score_matrix, 1e-10, None)
+        score_matrix /= score_matrix.sum()
 
-    # Logits match the target outcomes: 0=Home Win, 1=Draw, 2=Away Win
-    outcomes = {
-        "win_a_pct": float(probs[0]) * 100,
-        "draw_pct": float(probs[1]) * 100,
-        "win_b_pct": float(probs[2]) * 100,
-        "mu_h": float(probs[0] * 2), # Pseudo-lambda for stability
-        "mu_a": float(probs[2] * 2),
-        "logits": logits.cpu().numpy()[0].tolist()
+    # Calculate exact totals probabilities from the 10x10 matrix
+    o25_prob = 0.0
+    u35_prob = 0.0
+    for h in range(10):
+        for a in range(10):
+            if h + a > 2.5: o25_prob += score_matrix[h, a]
+            if h + a < 3.5: u35_prob += score_matrix[h, a]
+
+    total_expected_goals = mu_h + mu_a
+
+    outcomes_agg = {
+        "win_a_pct": float(probs_agg[0]) * 100,
+        "draw_pct": float(probs_agg[1]) * 100,
+        "win_b_pct": float(probs_agg[2]) * 100,
+        "mu_h": float(mu_h),
+        "mu_a": float(mu_a),
+        "expected_goals": float(total_expected_goals),
+        "over_2_5_pct": float(o25_prob * 100),
+        "under_3_5_pct": float(u35_prob * 100),
+        "logits": logits_agg.cpu().numpy()[0].tolist()
     }
-
-    return score_matrix, outcomes
+    
+    outcomes_cons = {
+        "win_a_pct": float(probs_cons[0]) * 100,
+        "draw_pct": float(probs_cons[1]) * 100,
+        "win_b_pct": float(probs_cons[2]) * 100,
+        "mu_h": float(mu_h),
+        "mu_a": float(mu_a),
+        "expected_goals": float(total_expected_goals),
+        "over_2_5_pct": float(o25_prob * 100),
+        "under_3_5_pct": float(u35_prob * 100),
+        "logits": logits_cons.cpu().numpy()[0].tolist()
+    }
+    
+    return score_matrix, outcomes_agg, outcomes_cons

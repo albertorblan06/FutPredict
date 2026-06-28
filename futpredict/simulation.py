@@ -48,18 +48,6 @@ def run_simulation(score_matrix, n_sims=None):
     over_2_5 = np.sum(total_goals > 2)
     btts = np.sum((home_goals > 0) & (away_goals > 0))
 
-    raw_over_pct = over_2_5 / n_sims * 100
-    expected_total = float(np.mean(total_goals))
-    
-    # Empirical recalibration for Over 2.5
-    # Poisson/NegBin matrices notoriously underestimate variance in football,
-    # leading to muted Over 2.5 probabilities. We stretch the probability to 
-    # make it sharper, and add a small bump near the 2.5 threshold.
-    centered = raw_over_pct - 50.0
-    sharpened = 50.0 + (centered * 1.35)  # 35% more decisive
-    bump = 5.0 * np.exp(-0.5 * ((expected_total - 2.5) / 0.5)**2)
-    calibrated_over = max(5.0, min(95.0, sharpened + bump))
-
     return {
         "n_sims": n_sims,
         "win_a_pct": win_a / n_sims * 100,
@@ -68,8 +56,8 @@ def run_simulation(score_matrix, n_sims=None):
         "top_scores": top_scores,
         "avg_goals_a": float(np.mean(home_goals)),
         "avg_goals_b": float(np.mean(away_goals)),
-        "over_2_5_pct": calibrated_over,
-        "under_2_5_pct": 100.0 - calibrated_over,
+        "over_2_5_pct": over_2_5 / n_sims * 100,
+        "under_2_5_pct": (n_sims - over_2_5) / n_sims * 100,
         "btts_yes_pct": btts / n_sims * 100,
         "btts_no_pct": (n_sims - btts) / n_sims * 100,
     }

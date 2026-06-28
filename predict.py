@@ -54,6 +54,22 @@ def main():
                         help="Force download latest matches from GitHub and rebuild DB")
     parser.add_argument("--date", type=str, default=None,
                         help="Simulate predictions as if today is this date (YYYY-MM-DD). Ignores any data after this date to prevent leakage.")
+    parser.add_argument("--absent-a", type=str, default=None,
+                        help="Comma-separated list of absent player names for Team A (lineup shock)")
+    parser.add_argument("--absent-b", type=str, default=None,
+                        help="Comma-separated list of absent player names for Team B (lineup shock)")
+    parser.add_argument("--knockout", action="store_true",
+                        help="Flag this match as a knockout-phase game (suppresses goal totals)")
+    parser.add_argument("--odds-a", type=float, default=None,
+                        help="Decimal odds for Team A (Home/Team 1) win (e.g. 2.10)")
+    parser.add_argument("--odds-d", type=float, default=None,
+                        help="Decimal odds for Draw (e.g. 3.40)")
+    parser.add_argument("--odds-b", type=float, default=None,
+                        help="Decimal odds for Team B (Away/Team 2) win (e.g. 3.80)")
+    parser.add_argument("--odds-qa", type=float, default=None,
+                        help="Decimal odds for Team A To Qualify (e.g. 1.80)")
+    parser.add_argument("--odds-qb", type=float, default=None,
+                        help="Decimal odds for Team B To Qualify (e.g. 2.00)")
     
     args = parser.parse_args()
 
@@ -165,12 +181,20 @@ def main():
         matrix_dc, dc_details = None, None
 
     print("\n┌─ Step 6/8: Machine Learning (XGBoost)...")
-    xgb_h, xgb_a, xgb_meta = train_xgb(conn, force=args.retrain_xgb)
+    over_models, xgb_btts, xgb_et, xgb_meta = train_xgb(conn, force=args.retrain_xgb)
     fifa_pts_a, _ = get_fifa_points(db_name_a)
     fifa_pts_b, _ = get_fifa_points(db_name_b)
     
-    matrix_xgb, xgb_details = predict_xgb(xgb_h, xgb_a, form_a, form_b, 
-                                          fifa_pts_a, fifa_pts_b, h2h, args.venue, conn=conn, team_a=db_name_a, team_b=db_name_b, match_date=args.date)
+    # Parse absent players
+    absent_a = [p.strip() for p in args.absent_a.split(",")] if args.absent_a else None
+    absent_b = [p.strip() for p in args.absent_b.split(",")] if args.absent_b else None
+    
+    matrix_xgb, xgb_details = predict_xgb(over_models, xgb_btts, xgb_et, form_a, form_b, 
+                                          fifa_pts_a, fifa_pts_b, h2h, args.venue,
+                                          conn=conn, team_a=db_name_a, team_b=db_name_b,
+                                          match_date=args.date,
+                                          absent_a=absent_a, absent_b=absent_b,
+                                          is_knockout=args.knockout)
 
     print("   ⬇  Loading Advanced Models (Corners, Cards, SOT, Possession)...")
     adv_cor, adv_car, adv_sot, adv_pos, adv_meta = train_advanced_xgb(conn, force=args.retrain_xgb)
@@ -184,9 +208,12 @@ def main():
         print("   ⚠  Could not predict advanced metrics (insufficient historical advanced stats).")
     
     print("\n┌─ Step 7/8: Deep Learning (LSTM+MDN & GoalCountNet)...")
-    lstm_model, lstm_goals, lstm_idx, lstm_meta = train_lstm_mdn(conn, force=args.retrain_dl)
-    matrix_lstm, lstm_details = predict_lstm(lstm_model, lstm_goals, lstm_idx, conn, 
-                                             db_name_a, db_name_b, args.venue, match_date=args.date)
+    lstm_model_agg, lstm_model_cons, lstm_goals, lstm_idx, lstm_meta_agg, lstm_meta_cons = train_lstm_mdn(conn, force=args.retrain_dl)
+    matrix_lstm, lstm_details_agg, lstm_details_cons = predict_lstm(
+        lstm_model_agg, lstm_model_cons, lstm_goals, lstm_idx, conn, 
+        db_name_a, db_name_b, args.venue, match_date=args.date, 
+        meta_agg=lstm_meta_agg, meta_cons=lstm_meta_cons
+    )
 
     print("\n┌─ Step 8/8: Simulating Specialized Markets...")
     
@@ -199,7 +226,14 @@ def main():
         goalscorers = []
 
     # Ensemble GoalCountNet with XGBoost for Totals
+    # XGBoost gets 65% weight — trained as direct binary classifiers for O/U
+    # LSTM GoalCountNet gets 35% — useful smoothing but has independence assumption
+    W_XGB, W_DL = 0.65, 0.35
     if matrix_lstm is not None and xgb_details is not None:
+        # Sanity check: compute Over 1.5 from the score matrix
+        dl_over_1_5 = sum(matrix_lstm[i, j] for i in range(10) for j in range(10) if i + j > 1.5) * 100
+        dl_usable = dl_over_1_5 >= 40.0  # Real football is ~80-85% Over 1.5
+        
         for thresh_num, thresh_str in [(1.5, "1_5"), (2.5, "2_5"), (3.5, "3_5"), (4.5, "4_5")]:
             o_prob = 0
             for i in range(10):
@@ -213,10 +247,12 @@ def main():
             xgb_over = xgb_details.get(f"over_{thresh_str}_pct", 0)
             xgb_under = xgb_details.get(f"under_{thresh_str}_pct", 0)
             
-            xgb_details[f"over_{thresh_str}_pct"] = (xgb_over + dl_over) / 2.0
-            xgb_details[f"under_{thresh_str}_pct"] = (xgb_under + dl_under) / 2.0
+            if dl_usable:
+                xgb_details[f"over_{thresh_str}_pct"] = W_XGB * xgb_over + W_DL * dl_over
+                xgb_details[f"under_{thresh_str}_pct"] = W_XGB * xgb_under + W_DL * dl_under
+            # else: keep XGBoost-only values
             
-        # Ensemble BTTS
+        # Ensemble BTTS (50/50 — both models calibrate well for this market)
         dl_btts_prob = 0
         for i in range(1, 10):
             for j in range(1, 10):
@@ -228,12 +264,29 @@ def main():
         xgb_btts_yes = xgb_details.get("btts_yes_pct", 0)
         xgb_btts_no = xgb_details.get("btts_no_pct", 0)
         
-        xgb_details["btts_yes_pct"] = (xgb_btts_yes + dl_btts_yes) / 2.0
-        xgb_details["btts_no_pct"] = (xgb_btts_no + dl_btts_no) / 2.0
+        if dl_usable:
+            xgb_details["btts_yes_pct"] = (xgb_btts_yes + dl_btts_yes) / 2.0
+            xgb_details["btts_no_pct"] = (xgb_btts_no + dl_btts_no) / 2.0
+            
+        # Ensemble Extra Time with LSTM Draw (Idea 1: 60/40)
+        if xgb_details.get("xgb_et_prob") is not None:
+            raw_et = xgb_details["xgb_et_prob"]
+            d_agg = lstm_details_agg.get("draw_pct", 0) / 100.0 if lstm_details_agg else 0.0
+            d_cons = lstm_details_cons.get("draw_pct", 0) / 100.0 if lstm_details_cons else 0.0
+            if lstm_details_agg and lstm_details_cons:
+                lstm_draw_prob = (d_agg + d_cons) / 2.0
+            elif lstm_details_agg or lstm_details_cons:
+                lstm_draw_prob = d_agg or d_cons
+            else:
+                lstm_draw_prob = 0.0
+                
+            if lstm_draw_prob > 0:
+                xgb_details["xgb_et_prob"] = (raw_et * 0.60) + (lstm_draw_prob * 0.40)
 
     outcomes = {
         "n_sims": args.sims,
-        "lstm": lstm_details or {},
+        "lstm_agg": lstm_details_agg or {},
+        "lstm_cons": lstm_details_cons or {},
         "xgb": xgb_details or {}
     }
     
@@ -246,8 +299,10 @@ def main():
         "dc": dc_details,
         "xgb": xgb_details,
         "xgb_meta": xgb_meta,
-        "lstm": lstm_details,
-        "lstm_meta": lstm_meta,
+        "lstm_agg": lstm_details_agg,
+        "lstm_cons": lstm_details_cons,
+        "lstm_meta_agg": lstm_meta_agg,
+        "lstm_meta_cons": lstm_meta_cons,
         "advanced": adv_details,
         "goalscorers": goalscorers
     }
@@ -264,7 +319,10 @@ def main():
         rank_a=get_fifa_rank(db_name_a), rank_b=get_fifa_rank(db_name_b),
         form_a=form_a, form_b=form_b, h2h=h2h,
         outcomes=outcomes, match_count=match_count,
-        models_info=models_info, home_adv_info=home_adv_info
+        models_info=models_info, home_adv_info=home_adv_info,
+        odds=(args.odds_a, args.odds_d, args.odds_b) if args.odds_a else None,
+        is_knockout=args.knockout,
+        odds_q=(args.odds_qa, args.odds_qb) if args.odds_qa else None
     )
 
 if __name__ == "__main__":
