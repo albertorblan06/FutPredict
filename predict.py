@@ -20,7 +20,7 @@ os.environ["OMP_NUM_THREADS"] = "1"
 
 from futpredict.config import DB_PATH
 from futpredict.data import (get_connection, setup_database, download_all,
-                             import_matches, import_historical_rankings)
+                             import_matches, import_historical_rankings, import_shootouts)
 from futpredict.rankings import (load_rankings_from_csv, import_rankings_2026_to_db,
                                  get_fifa_points, get_fifa_rank)
 from futpredict.names import find_team_in_db, suggest_teams
@@ -29,6 +29,7 @@ from futpredict.analysis import get_recent_form, get_head_to_head
 from futpredict.home_advantage import compute_home_advantage
 from futpredict.statistical_model import fit_dixon_coles, predict_dc
 from futpredict.xgb_model import train_xgb, predict_xgb
+from futpredict.xgb_advance import train_advance_xgb, predict_advance
 from futpredict.xgb_advanced import train_advanced_xgb, predict_advanced
 from futpredict.deep_model import train_lstm_mdn, predict_lstm
 from futpredict.blending import blend_matrices, optimize_blend_weights, matrix_to_outcomes
@@ -101,6 +102,7 @@ def main():
         setup_database(conn)
         import_rankings_2026_to_db(conn)
         download_all()
+        import_shootouts(conn)
         import_matches(conn)
         import_historical_rankings(conn)
         
@@ -125,6 +127,8 @@ def main():
     if args.train_only:
         print("\n┌─ Step 2/3: Training Machine Learning (XGBoost)...")
         train_xgb(conn, force=args.retrain_xgb)
+        train_advance_xgb(conn, force=args.retrain_xgb)
+        train_advanced_xgb(conn, force=args.retrain_xgb)
         
         try:
             from futpredict.player_model import train_player_model
@@ -182,6 +186,11 @@ def main():
 
     print("\n┌─ Step 6/8: Machine Learning (XGBoost)...")
     over_models, xgb_btts, xgb_et, xgb_meta = train_xgb(conn, force=args.retrain_xgb)
+    
+    if args.knockout:
+        advance_model = train_advance_xgb(conn, force=args.retrain_xgb)
+    else:
+        advance_model = None
     fifa_pts_a, _ = get_fifa_points(db_name_a)
     fifa_pts_b, _ = get_fifa_points(db_name_b)
     
@@ -189,12 +198,16 @@ def main():
     absent_a = [p.strip() for p in args.absent_a.split(",")] if args.absent_a else None
     absent_b = [p.strip() for p in args.absent_b.split(",")] if args.absent_b else None
     
-    matrix_xgb, xgb_details = predict_xgb(over_models, xgb_btts, xgb_et, form_a, form_b, 
+    matrix_xgb, xgb_details, feature_vec = predict_xgb(over_models, xgb_btts, xgb_et, form_a, form_b, 
                                           fifa_pts_a, fifa_pts_b, h2h, args.venue,
                                           conn=conn, team_a=db_name_a, team_b=db_name_b,
                                           match_date=args.date,
                                           absent_a=absent_a, absent_b=absent_b,
                                           is_knockout=args.knockout)
+    if xgb_details:
+        if args.knockout and advance_model:
+            xgb_details["advance_prob"] = predict_advance(advance_model, feature_vec)
+        print("   ✓  Market metrics predicted.")
 
     print("   ⬇  Loading Advanced Models (Corners, Cards, SOT, Possession)...")
     adv_cor, adv_car, adv_sot, adv_pos, adv_meta = train_advanced_xgb(conn, force=args.retrain_xgb)

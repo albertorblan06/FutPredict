@@ -283,6 +283,7 @@ def build_features(conn, force_momentum=False):
                     "total_goals": total_goals,
                     "btts": 1 if int(score_a) > 0 and int(score_b) > 0 else 0,
                     "goes_to_et": 1 if int(score_a) == int(score_b) else 0,
+                    "advance_target": 1 if row.get("advance_team") == team_a else (0 if row.get("advance_team") == team_b else None),
                 }
                 # Binary Over targets for direct classification
                 for thresh in XGB_OVER_THRESHOLDS:
@@ -707,7 +708,7 @@ def predict_xgb(over_models, model_btts, model_et, form_a, form_b,
         et_prob = float(model_et.predict_proba(feature_vec)[0, 1])
         outcomes["xgb_et_prob"] = et_prob
 
-    return None, outcomes
+    return None, outcomes, feature_vec
 
 
 def _compute_xg_concentration_live(conn, team, match_date):

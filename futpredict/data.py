@@ -6,8 +6,8 @@ import csv
 import os
 import sqlite3
 from urllib.request import urlopen
-from .config import (DATA_DIR, DB_PATH, RESULTS_CSV, RANKINGS_HIST_CSV,
-                     RESULTS_URL, RANKINGS_URL)
+from .config import (DATA_DIR, DB_PATH, RESULTS_CSV, RANKINGS_HIST_CSV, SHOOTOUTS_CSV,
+                     RESULTS_URL, RANKINGS_URL, SHOOTOUTS_URL)
 
 
 def download_csv(url, filepath):
@@ -44,6 +44,7 @@ def setup_database(conn):
     conn.executescript("""
         DROP TABLE IF EXISTS matches;
         DROP TABLE IF EXISTS fifa_rankings;
+        DROP TABLE IF EXISTS shootouts;
 
         CREATE TABLE matches (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,7 +56,15 @@ def setup_database(conn):
             tournament TEXT,
             city TEXT,
             country TEXT,
-            neutral TEXT
+            neutral TEXT,
+            advance_team TEXT
+        );
+
+        CREATE TABLE shootouts (
+            date TEXT NOT NULL,
+            home_team TEXT NOT NULL,
+            away_team TEXT NOT NULL,
+            winner TEXT NOT NULL
         );
 
         CREATE TABLE fifa_rankings (
@@ -151,6 +160,55 @@ def import_matches(conn, filepath=None):
                 "INSERT INTO matches (date, home_team, away_team, "
                 "home_score, away_score, tournament, city, country, neutral) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", batch)
+    
+    # After importing, resolve advance_team using shootouts
+    conn.execute("""
+        UPDATE matches
+        SET advance_team =
+          CASE
+            WHEN home_score > away_score THEN home_team
+            WHEN away_score > home_score THEN away_team
+            ELSE (
+              SELECT winner
+              FROM shootouts
+              WHERE shootouts.date = matches.date
+                AND shootouts.home_team = matches.home_team
+                AND shootouts.away_team = matches.away_team
+            )
+          END
+    """)
+    conn.commit()
+    return count
+
+def import_shootouts(conn, filepath=None):
+    """Bulk-import penalty shootouts CSV into SQLite."""
+    filepath = filepath or SHOOTOUTS_CSV
+    if not os.path.exists(filepath):
+        return 0
+    count = 0
+    with open(filepath, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        batch = []
+        for row in reader:
+            try:
+                batch.append((
+                    row["date"],
+                    row["home_team"].strip(),
+                    row["away_team"].strip(),
+                    row["winner"].strip()
+                ))
+                count += 1
+            except (ValueError, KeyError):
+                continue
+            if len(batch) >= 5000:
+                conn.executemany(
+                    "INSERT INTO shootouts (date, home_team, away_team, winner) "
+                    "VALUES (?, ?, ?, ?)", batch)
+                batch = []
+        if batch:
+            conn.executemany(
+                "INSERT INTO shootouts (date, home_team, away_team, winner) "
+                "VALUES (?, ?, ?, ?)", batch)
     conn.commit()
     return count
 
@@ -192,7 +250,8 @@ def import_historical_rankings(conn, filepath=None):
 
 
 def download_all():
-    """Download all data sources. Returns (ok_results, ok_rankings)."""
+    """Download all data sources. Returns (ok_results, ok_rankings, ok_shootouts)."""
     ok_results = download_csv(RESULTS_URL, RESULTS_CSV)
     ok_rankings = download_csv(RANKINGS_URL, RANKINGS_HIST_CSV)
-    return ok_results, ok_rankings
+    ok_shootouts = download_csv(SHOOTOUTS_URL, SHOOTOUTS_CSV)
+    return ok_results, ok_rankings, ok_shootouts

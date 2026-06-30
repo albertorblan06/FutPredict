@@ -9,11 +9,13 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "futpredict.db")
 RESULTS_CSV = os.path.join(DATA_DIR, "results.csv")
+SHOOTOUTS_CSV = os.path.join(DATA_DIR, "shootouts.csv")
 RANKINGS_HIST_CSV = os.path.join(DATA_DIR, "rankings_historical.csv")
 RANKINGS_2026_CSV = os.path.join(DATA_DIR, "fifa_rankings_2026.csv")
 XGB_TOTALS_MODEL = os.path.join(DATA_DIR, "xgb_totals.json")  # Legacy — kept for cache cleanup
 XGB_BTTS_MODEL = os.path.join(DATA_DIR, "xgb_btts.json")
 XGB_ET_MODEL = os.path.join(DATA_DIR, "xgb_et.json")
+XGB_ADVANCE_MODEL = os.path.join(DATA_DIR, "xgb_advance.json")
 
 # ── OVER/UNDER DIRECT CLASSIFIERS ──
 XGB_OVER_THRESHOLDS = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5]
@@ -34,6 +36,8 @@ LSTM_CONS_META_PATH = os.path.join(DATA_DIR, "lstm_cons_meta.json")
 # ── DATA SOURCES ──
 RESULTS_URL = ("https://raw.githubusercontent.com/martj42/"
                "international_results/master/results.csv")
+SHOOTOUTS_URL = ("https://raw.githubusercontent.com/martj42/"
+                 "international_results/master/shootouts.csv")
 RANKINGS_URL = ("https://raw.githubusercontent.com/Dato-Futbol/"
                 "fifa-ranking/master/ranking_fifa_historical.csv")
 

@@ -184,14 +184,21 @@ def print_report(name_a, name_b, db_name_a, db_name_b,
     q_a = 0
     q_b = 0
     if is_knockout:
-        elo_a = fifa_pts_a if fifa_pts_a else 1500
-        elo_b = fifa_pts_b if fifa_pts_b else 1500
-        total_elo = elo_a + elo_b
-        edge_a = elo_a / total_elo if total_elo > 0 else 0.5
-        edge_b = 1.0 - edge_a
+        xgb_info = models_info.get("xgb", {})
+        advance_prob = xgb_info.get("advance_prob")
         
-        q_a = w_a_mean + (d_mean * edge_a)
-        q_b = w_b_mean + (d_mean * edge_b)
+        if advance_prob is not None:
+            q_a = advance_prob * 100
+            q_b = (1.0 - advance_prob) * 100
+        else:
+            elo_a = fifa_pts_a if fifa_pts_a else 1500
+            elo_b = fifa_pts_b if fifa_pts_b else 1500
+            total_elo = elo_a + elo_b
+            edge_a = elo_a / total_elo if total_elo > 0 else 0.5
+            edge_b = 1.0 - edge_a
+            
+            q_a = w_a_mean + (d_mean * edge_a)
+            q_b = w_b_mean + (d_mean * edge_b)
         
         console.print(f"\n[bold underline]TO QUALIFY / ADVANCE[/bold underline] [dim](Includes Extra Time & Penalties)[/dim]")
         table_q = Table(box=box.SIMPLE, show_header=False, expand=True)
@@ -249,77 +256,7 @@ def print_report(name_a, name_b, db_name_a, db_name_b,
         console.print(t_mark)
         
 
-    # ── GOALSCORERS ──
-    goalscorers = models_info.get("goalscorers", [])
-    if goalscorers:
-        console.print("\n[bold underline]ANYTIME GOALSCORER PREDICTION[/bold underline] [dim](XGBoost Player Models)[/dim]")
-        
-        t_scorers = Table(box=box.SIMPLE, show_header=True, expand=True)
-        t_scorers.add_column("Rank", style="dim")
-        t_scorers.add_column("Player", style="bold")
-        t_scorers.add_column("Team", style="dim")
-        t_scorers.add_column("Pos", style="dim")
-        t_scorers.add_column("Avg xG", justify="right")
-        t_scorers.add_column("Prob", justify="right", style="bold green")
-        
-        for i, p in enumerate(goalscorers[:5]):
-            t_scorers.add_row(
-                f"{i+1}.",
-                p["player_name"],
-                p["team"],
-                p["position"],
-                f"{p['xg_avg']:.2f}",
-                color_pct_text(p["prob"])
-            )
-        console.print(t_scorers)
 
-    # ── ADVANCED METRICS ──
-    adv = models_info.get("advanced")
-    if adv:
-        console.print("\n[bold underline]ADVANCED METRICS PREDICTION[/bold underline] [dim](Time-Binned Deep Features)[/dim]")
-        
-        t_adv = Table(box=box.SIMPLE, show_header=True, expand=True)
-        t_adv.add_column("Corners", justify="left")
-        t_adv.add_column("", justify="left")
-        t_adv.add_column("Cards", justify="left")
-        t_adv.add_column("", justify="left")
-        t_adv.add_column("Target Shots", justify="left")
-        t_adv.add_column("", justify="left")
-        
-        cor = adv["expected_corners"]
-        car = adv["expected_cards"]
-        sot = adv["expected_sot"]
-        pos = adv["home_possession"]
-        
-        base_cor = max(0, int(round(cor)) - 2)
-        base_car = max(0, int(round(car)) - 2)
-        base_sot = max(0, int(round(sot)) - 2)
-        
-        for i in range(5):
-            c_val = base_cor + i
-            ca_val = base_car + i
-            s_val = base_sot + i
-            
-            o_cor = (1 - stats.poisson.cdf(c_val, cor)) * 100
-            u_cor = stats.poisson.cdf(c_val, cor) * 100
-            
-            o_car = (1 - stats.poisson.cdf(ca_val, car)) * 100
-            u_car = stats.poisson.cdf(ca_val, car) * 100
-            
-            o_sot = (1 - stats.poisson.cdf(s_val, sot)) * 100
-            u_sot = stats.poisson.cdf(s_val, sot) * 100
-            
-            t_adv.add_row(
-                f"Over {c_val}.5:  {color_pct_text(o_cor)}", f"Under {c_val}.5:  {color_pct_text(u_cor)}",
-                f"Over {ca_val}.5:  {color_pct_text(o_car)}", f"Under {ca_val}.5:  {color_pct_text(u_car)}",
-                f"Over {s_val}.5:  {color_pct_text(o_sot)}", f"Under {s_val}.5:  {color_pct_text(u_sot)}"
-            )
-            
-        console.print(t_adv)
-        
-        pos_h = min(100.0, max(0.0, pos))
-        pos_a = 100.0 - pos_h
-        console.print(f"  [bold magenta]Possession:[/bold magenta] {name_a}: [bold]{pos_h:.1f}%[/bold] │ {name_b}: [bold]{pos_a:.1f}%[/bold]\n")
 
     # ── Totals Betting: Dynamic Line Shifting (Target 78%) ──
     TARGET_WIN_RATE = 78.0
