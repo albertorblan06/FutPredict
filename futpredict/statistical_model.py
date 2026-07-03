@@ -17,6 +17,7 @@ from scipy.special import gammaln
 from scipy.optimize import minimize
 from .config import DC_TRAIN_YEARS, MAX_GOALS
 from .analysis import get_tournament_weight
+from .weight_optimizer import get_weights
 
 
 def _dc_tau(h, a, lambda_h, lambda_a, rho):
@@ -136,13 +137,15 @@ def _neg_log_likelihood(params, home_idx, away_idx, home_goals, away_goals, weig
     return -ll + reg
 
 
-def fit_dixon_coles(conn, force=False, years_back=None, reference_date=None):
+def fit_dixon_coles(conn, force=False, years_back=None, reference_date=None,
+                    weights=None):
     """
     Fit the Dixon-Coles Negative Binomial model to recent match data.
     
     Args:
         reference_date: If provided, only use matches before this date and
                         compute time-decay relative to it (prevents data leakage).
+        weights: Optional LearnedWeights for tournament weights and decay.
     """
     cache_path = "data/dc_model.json"
     if not force and reference_date is None and os.path.exists(cache_path):
@@ -181,7 +184,8 @@ def fit_dixon_coles(conn, force=False, years_back=None, reference_date=None):
     n_teams = len(teams)
 
     # Prepare match data with time-decay weighting
-    decay_lambda = math.log(2) / (365 * 2)  # 2-year half-life
+    weights = weights or get_weights()
+    decay_lambda = math.log(2) / weights.dc_decay_half_life
 
     matches = []
     for home, away, hs, as_, tournament, date_str, neutral in rows:
@@ -191,7 +195,7 @@ def fit_dixon_coles(conn, force=False, years_back=None, reference_date=None):
             continue
         days_ago = (ref - match_date).days
         time_w = math.exp(-decay_lambda * days_ago)
-        tourn_w = get_tournament_weight(tournament)
+        tourn_w = get_tournament_weight(tournament, weights=weights)
         weight = time_w * tourn_w
         matches.append((home, away, int(hs), int(as_), weight))
 

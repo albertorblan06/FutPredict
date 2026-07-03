@@ -35,6 +35,7 @@ from futpredict.deep_model import train_lstm_mdn, predict_lstm
 from futpredict.blending import blend_matrices, optimize_blend_weights, matrix_to_outcomes
 from futpredict.simulation import run_simulation
 from futpredict.report import print_report
+from futpredict.weight_optimizer import get_weights, run_optimization, reset_weights_cache, LEARNED_WEIGHTS_PATH
 
 
 def main():
@@ -71,6 +72,12 @@ def main():
                         help="Decimal odds for Team A To Qualify (e.g. 1.80)")
     parser.add_argument("--odds-qb", type=float, default=None,
                         help="Decimal odds for Team B To Qualify (e.g. 2.00)")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Run Optuna weight calibration (auto-tune tournament weights, decay, Elo K-factors)")
+    parser.add_argument("--calibrate-trials", type=int, default=150,
+                        help="Number of Optuna trials for calibration (default: 150)")
+    parser.add_argument("--show-weights", action="store_true",
+                        help="Display current learned weights and exit")
     
     args = parser.parse_args()
 
@@ -78,7 +85,7 @@ def main():
     team_a_input = args.team_a
     team_b_input = args.team_b
 
-    if not args.train_only and (not team_a_input or not team_b_input):
+    if not args.train_only and not args.calibrate and not args.show_weights and (not team_a_input or not team_b_input):
         print("\n╔════════════════════════════════════════════════════════════╗")
         print("║  FUTPREDICT v2.0 — Interactive Mode                        ║")
         print("╚════════════════════════════════════════════════════════════╝\n")
@@ -123,6 +130,37 @@ def main():
     match_count = cur.fetchone()[0]
         
     print(f"   ✓  Database ready ({match_count:,} matches)")
+
+    # ── Weight Status ──
+    weights = get_weights()
+    if weights.optimized_at:
+        print(f"   ✓  Using learned weights (Brier={weights.brier_score:.4f}, "
+              f"O/U LogLoss={weights.ou_logloss:.4f})")
+    else:
+        print(f"   ⚠  Using default weights (run --calibrate to optimize)")
+
+    # ── Show Weights Mode ──
+    if args.show_weights:
+        from dataclasses import asdict
+        print("\n┌─ Current Weights:")
+        for key, val in asdict(weights).items():
+            if key in ("brier_score", "ou_logloss", "optimized_at", "n_trials"):
+                continue
+            print(f"   {key:<24} = {val}")
+        if weights.optimized_at:
+            print(f"\n   Calibrated at: {weights.optimized_at}")
+            print(f"   Trials:        {weights.n_trials}")
+            print(f"   Brier Score:   {weights.brier_score:.4f}")
+            print(f"   O/U LogLoss:   {weights.ou_logloss:.4f}")
+        sys.exit(0)
+
+    # ── Calibration Mode ──
+    if args.calibrate:
+        best_weights = run_optimization(conn, n_trials=args.calibrate_trials)
+        reset_weights_cache()
+        print("\n   ✓  Calibration complete. Re-run predict.py to use new weights.")
+        print("   💡 You should now retrain all models: python predict.py --train-only --retrain-xgb --retrain-dl")
+        sys.exit(0)
     
     if args.train_only:
         print("\n┌─ Step 2/3: Training Machine Learning (XGBoost)...")

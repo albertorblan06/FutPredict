@@ -87,7 +87,7 @@ def main():
     
     # Load models once
     dc_params = fit_dixon_coles(conn, reference_date=args.date)
-    over_models, xgb_btts, _ = train_xgb(conn, force=False)
+    over_models, xgb_btts, xgb_et, _ = train_xgb(conn, force=False)
     lstm_model_agg, lstm_model_cons, lstm_goals, lstm_idx, lstm_meta_agg, lstm_meta_cons = train_lstm_mdn(conn, force=False)
     m_cor, m_car, m_sot, m_pos, _ = train_advanced_xgb(conn, force=False)
     
@@ -148,7 +148,7 @@ def main():
         fifa_pts_a, _ = get_fifa_points(team_a_db)
         fifa_pts_b, _ = get_fifa_points(team_b_db)
         
-        _, xgb_details = predict_xgb(over_models, xgb_btts, form_a, form_b, fifa_pts_a, fifa_pts_b, h2h, venue="neutral", conn=conn, team_a=team_a_db, team_b=team_b_db, match_date=test_date)
+        _, xgb_details, _ = predict_xgb(over_models, xgb_btts, xgb_et, form_a, form_b, fifa_pts_a, fifa_pts_b, h2h, venue="neutral", conn=conn, team_a=team_a_db, team_b=team_b_db, match_date=test_date)
         matrix_lstm, lstm_details_agg, lstm_details_cons = predict_lstm(lstm_model_agg, lstm_model_cons, lstm_goals, lstm_idx, conn, team_a_db, team_b_db, venue="neutral", match_date=test_date, meta_agg=lstm_meta_agg, meta_cons=lstm_meta_cons)
         
         actual_1x2 = "1" if score_a > score_b else ("2" if score_b > score_a else "X")

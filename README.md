@@ -24,6 +24,7 @@ FutPredict is built on the philosophy of zero data leakage. Performance metrics 
 
 ### Data Integrity Guarantee
 *   **Walk-Forward Validation:** True time-machine backtesting. Models automatically purge future data, iteratively retrain, and predict unseen tournaments to simulate true live-production performance.
+*   **Bayesian Hyperparameter Auto-Tuning:** Uses Optuna with expanding-window temporal cross-validation to dynamically learn and calibrate tournament weights, Elo K-factors, and time-decay half-lives with zero data leakage.
 *   **Dynamic Elo Engine:** Calculates rolling historical Elo ratings from 1990 to present, replacing static FIFA rankings to accurately map true team strength.
 *   **Dual-Architecture Probability:** The system computes two distinct paradigms (Aggressive Focal Loss vs Conservative Cross-Entropy) and averages them into a Consensus Mean for absolute stability.
 
@@ -127,6 +128,15 @@ Validate the engine's Knockout accuracy against historical hold-out sets (e.g., 
 python3 backtest_ko.py
 ```
 *Warning: This script simulates true time-travel. It dynamically alters system configurations, forces multiple total-system retrains to purge future data, and takes ~10 minutes to complete.*
+
+### 3. Hyperparameter Auto-Tuning (Optuna)
+Dynamically calibrate tournament weights, Elo K-factors, and time-decay half-lives to the most optimal configuration using expanding-window temporal cross-validation:
+
+```bash
+python3 predict.py --calibrate
+# View comparison report of learned vs default weights
+python3 -m futpredict.calibration_report
+```
 
 ---
 *Built for predictive excellence. Not financial advice.*

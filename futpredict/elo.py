@@ -5,26 +5,18 @@ from tqdm import tqdm
 from collections import defaultdict
 from .config import DB_PATH
 from .data import get_connection
+from .weight_optimizer import get_weights, k_factor_from_learned
 
-def calculate_k_factor(tournament, is_neutral=False):
-    """Determine the K-factor based on match importance."""
-    t = (tournament or "").lower()
-    
-    if "world cup" in t and "qualif" not in t:
-        return 60
-    if any(kw in t for kw in ("copa amér", "copa amer", "uefa euro", "european championship", "african cup", "asian cup")):
-        return 50 if "qualif" not in t else 40
-    if "qualif" in t:
-        return 30
-    if "nations league" in t:
-        return 30
-    if "gold cup" in t or "concacaf" in t:
-        return 40
-    if "friendly" in t:
-        return 15
-    return 20
+def calculate_k_factor(tournament, is_neutral=False, weights=None):
+    """Determine the K-factor based on match importance.
 
-def calculate_elo_history(conn, force=False):
+    Uses learned weights if calibrated, otherwise falls back to defaults.
+    The optional `weights` parameter allows the optimizer to inject
+    trial-specific weights during evaluation without side effects.
+    """
+    return k_factor_from_learned(tournament, weights=weights)
+
+def calculate_elo_history(conn, force=False, weights=None):
     """
     Calculate Elo ratings for all teams chronologically.
     Stores results in the 'elo_history' table.
@@ -84,7 +76,7 @@ def calculate_elo_history(conn, force=False):
         else:
             g_mult = (11.0 + gd) / 8.0
             
-        k = calculate_k_factor(tourn, neut)
+        k = calculate_k_factor(tourn, neut, weights=weights)
         
         # Elo updates
         change_h = k * g_mult * (s_h - e_h)

@@ -4,32 +4,22 @@ Extracted from the monolith with imports from the new package structure.
 """
 import datetime
 import math
-from .config import DECAY_HALF_LIFE_DAYS, H2H_DECAY_HALF_LIFE, LOOKBACK_MATCHES
+from .config import LOOKBACK_MATCHES
 from .rankings import get_fifa_points, get_median_fifa
 from .names import get_all_names
+from .weight_optimizer import (
+    get_weights, tournament_weight_from_learned, LearnedWeights,
+)
 
 
-def get_tournament_weight(tournament_name):
-    """Classify tournament and return weight (0.0-1.0)."""
-    t = (tournament_name or "").lower()
-    if "world cup" in t:
-        return 0.85 if "qualif" in t else 1.0
-    if any(kw in t for kw in ("copa amér", "copa amer", "uefa euro",
-                               "european championship")):
-        return 0.80 if "qualif" in t else 0.90
-    if any(kw in t for kw in ("african cup", "africa cup", "afcon")):
-        return 0.80 if "qualif" in t else 0.90
-    if "asian cup" in t:
-        return 0.75 if "qualif" in t else 0.85
-    if "gold cup" in t or "concacaf nations" in t:
-        return 0.80
-    if "nations league" in t:
-        return 0.80
-    if "confederations cup" in t:
-        return 0.85
-    if "friendly" in t:
-        return 0.60
-    return 0.70
+def get_tournament_weight(tournament_name, weights=None):
+    """Classify tournament and return weight (0.0-1.0).
+
+    Uses learned weights if calibrated, otherwise falls back to defaults.
+    The optional `weights` parameter allows the optimizer to inject
+    trial-specific weights during evaluation without side effects.
+    """
+    return tournament_weight_from_learned(tournament_name, weights=weights)
 
 
 def _lookup_historical_points(conn, team_name, match_date):
@@ -47,11 +37,13 @@ def _lookup_historical_points(conn, team_name, match_date):
     return None
 
 
-def get_recent_form(conn, team_db_name, lookback=None, reference_date=None):
+def get_recent_form(conn, team_db_name, lookback=None, reference_date=None,
+                    weights=None):
     """
     Analyze the team's last `lookback` matches with exponential time decay
     and opponent-strength weighting.
     """
+    weights = weights or get_weights()
     lookback = lookback or LOOKBACK_MATCHES
     if reference_date is None:
         reference_date = datetime.date.today().isoformat()
@@ -67,7 +59,7 @@ def get_recent_form(conn, team_db_name, lookback=None, reference_date=None):
         return None
 
     ref = datetime.date.fromisoformat(reference_date)
-    decay_lambda = math.log(2) / DECAY_HALF_LIFE_DAYS
+    decay_lambda = math.log(2) / weights.decay_half_life
     median = get_median_fifa()
 
     total_w = 0.0
@@ -85,7 +77,7 @@ def get_recent_form(conn, team_db_name, lookback=None, reference_date=None):
             continue
 
         time_weight = math.exp(-decay_lambda * days_ago)
-        tourn_weight = get_tournament_weight(tournament)
+        tourn_weight = get_tournament_weight(tournament, weights=weights)
         weight = time_weight * tourn_weight
 
         is_home = (home == team_db_name)
@@ -153,8 +145,10 @@ def get_recent_form(conn, team_db_name, lookback=None, reference_date=None):
     }
 
 
-def get_head_to_head(conn, team_a_db, team_b_db, reference_date=None):
+def get_head_to_head(conn, team_a_db, team_b_db, reference_date=None,
+                     weights=None):
     """Analyze all historical matches between team A and team B."""
+    weights = weights or get_weights()
     if reference_date is None:
         reference_date = datetime.date.today().isoformat()
         
@@ -177,7 +171,7 @@ def get_head_to_head(conn, team_a_db, team_b_db, reference_date=None):
         return result
 
     ref = datetime.date.fromisoformat(reference_date)
-    decay_lambda = math.log(2) / H2H_DECAY_HALF_LIFE
+    decay_lambda = math.log(2) / weights.h2h_decay_half_life
 
     total_w = w_gf_a = w_gf_b = 0.0
     wins_a = draws = wins_b = 0

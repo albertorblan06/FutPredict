@@ -32,6 +32,7 @@ LSTM_MODEL_PATH = os.path.join(DATA_DIR, "lstm_mdn.pt")
 LSTM_META_PATH = os.path.join(DATA_DIR, "lstm_meta.json")
 LSTM_CONS_MODEL_PATH = os.path.join(DATA_DIR, "lstm_mdn_cons.pt")
 LSTM_CONS_META_PATH = os.path.join(DATA_DIR, "lstm_cons_meta.json")
+LEARNED_WEIGHTS_PATH = os.path.join(DATA_DIR, "learned_weights.json")
 
 # ── DATA SOURCES ──
 RESULTS_URL = ("https://raw.githubusercontent.com/martj42/"
