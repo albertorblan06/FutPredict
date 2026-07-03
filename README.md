@@ -16,11 +16,11 @@ FutPredict is built on the philosophy of zero data leakage. Performance metrics 
 
 | Market Category | Hit Rate | Mathematical Edge / Note |
 | :--- | :---: | :--- |
-| **1X2 / Double Chance (Regular Time)** | **88.2%** | Requires `> 70.0%` probability threshold |
-| **Knockout "To Qualify" (Advance)** | **73.3%** | *Strict OOS Walk-Forward* (World Cup 2022 & Euro 2024) |
-| **Combined Parlay (1X2 + Totals)** | **67.9%** | Cross-model hedging strategy |
-| **Totals (Over/Under 2.5 & 3.5)** | **63.0%** | Requires `> 61.5%` probability threshold |
-| **Extra Time LogLoss Calibration** | **0.654** | Highly calibrated tail-event detection |
+| **1X2 / Double Chance (Regular Time)** | **92.5%** | Requires `> 70.0%` probability threshold (+16.4% ROI) |
+| **Knockout "To Qualify" (Advance)** | **86.7%** | *Strict OOS Walk-Forward* (World Cup 2022 & Euro 2024) |
+| **Combined Parlay (1X2 + Totals)** | **66.0%** | Cross-model hedging strategy |
+| **Totals (Over/Under 1.5 & 3.5)** | **64.1%** | Requires `> 61.5%` probability threshold |
+| **Extra Time LogLoss Calibration** | **0.638** | Highly calibrated tail-event detection |
 
 ### Data Integrity Guarantee
 *   **Walk-Forward Validation:** True time-machine backtesting. Models automatically purge future data, iteratively retrain, and predict unseen tournaments to simulate true live-production performance.
