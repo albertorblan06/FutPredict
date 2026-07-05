@@ -239,6 +239,38 @@ def print_report(name_a, name_b, db_name_a, db_name_b,
     xgb_o = outcomes.get("xgb", outcomes.get("lstm", {}))
     if xgb_o:
         console.print("\n[bold underline]MARKET PROBABILITIES[/bold underline] [dim](XGBoost)[/dim]")
+        
+        # --- Per-Team Expected Goals (Poisson from Dixon-Coles) ---
+        import math
+        dc_info = models_info.get("dc", {}) if models_info else {}
+        lam_h = dc_info.get("lambda_h", 1.0)
+        lam_a = dc_info.get("lambda_a", 1.0)
+        
+        def p_over(lam, goals):
+            prob_under_or_eq = sum((math.exp(-lam) * (lam**k)) / math.factorial(k) for k in range(goals + 1))
+            return (1.0 - prob_under_or_eq) * 100
+            
+        t_team_goals = Table(box=box.SIMPLE, show_header=False, expand=True)
+        t_team_goals.add_column()
+        t_team_goals.add_column()
+        t_team_goals.add_column()
+        t_team_goals.add_column()
+        
+        t_team_goals.add_row(f"[bold]{name_a} Over 0.5:[/bold]", color_pct_text(p_over(lam_h, 0)), f"[bold]{name_b} Over 0.5:[/bold]", color_pct_text(p_over(lam_a, 0)))
+        t_team_goals.add_row(f"[bold]{name_a} Over 1.5:[/bold]", color_pct_text(p_over(lam_h, 1)), f"[bold]{name_b} Over 1.5:[/bold]", color_pct_text(p_over(lam_a, 1)))
+        t_team_goals.add_row(f"[bold]{name_a} Over 2.5:[/bold]", color_pct_text(p_over(lam_h, 2)), f"[bold]{name_b} Over 2.5:[/bold]", color_pct_text(p_over(lam_a, 2)))
+        
+        # Graphic representation
+        total_blocks = 30
+        ratio = lam_h / (lam_h + lam_a) if (lam_h + lam_a) > 0 else 0.5
+        filled = int(ratio * total_blocks)
+        empty = total_blocks - filled
+        graphic = f"[bold]{name_a[:3].upper()}[/bold] [cyan]{'█' * filled}[/cyan][dim]{'░' * empty}[/dim] [bold]{name_b[:3].upper()}[/bold]"
+        
+        console.print(Panel(Align.center(f"Expected Goals Ratio\n{lam_h:.2f} — {lam_a:.2f}\n{graphic}"), border_style="dim"))
+        console.print(t_team_goals)
+        console.print("")
+        
         t_mark = Table(box=box.SIMPLE, show_header=False, expand=True)
         t_mark.add_column()
         t_mark.add_column()

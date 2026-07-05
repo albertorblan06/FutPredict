@@ -1,0 +1,23 @@
+{
+  "w_world_cup": 0.932642245215121,
+  "w_world_cup_qual": 0.796167156851589,
+  "w_continental_final": 0.9372604369705397,
+  "w_continental_qual": 0.6925686053024263,
+  "w_nations_league": 0.7295926780489725,
+  "w_friendly": 0.6836974765900913,
+  "w_other": 0.5674364761107928,
+  "decay_half_life": 167.37589800139946,
+  "h2h_decay_half_life": 1464.1110684935165,
+  "dc_decay_half_life": 1392.9243323585713,
+  "k_world_cup": 37.22770549741124,
+  "k_continental": 61.35891784048921,
+  "k_continental_qual": 52.11420606345765,
+  "k_qualifier": 41.77485122347925,
+  "k_nations_league": 19.27059318393247,
+  "k_friendly": 18.456117074993863,
+  "k_other": 38.218879394887836,
+  "brier_score": 0.5024799858027682,
+  "ou_logloss": 0.7018426661372864,
+  "optimized_at": "2026-07-03T12:44:31.035467",
+  "n_trials": 150
+}

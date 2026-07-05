@@ -1,0 +1,13 @@
+{
+  "features": [
+    "rolling_xg",
+    "rolling_xa",
+    "rolling_shots",
+    "rolling_goals",
+    "rolling_assists",
+    "rolling_off_contrib",
+    "rolling_def_contrib",
+    "rolling_rating"
+  ],
+  "samples": 53352
+}

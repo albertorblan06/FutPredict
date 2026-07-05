@@ -51,6 +51,19 @@ for i in range(8):
     FEATURE_COLUMNS.append(f"h_momentum_{i}")
     FEATURE_COLUMNS.append(f"a_momentum_{i}")
 
+# BTTS-specific features (10-match rolling window)
+BTTS_EXTRA_COLUMNS = [
+    "btts_rate_a", "btts_rate_b",
+    "scoring_rate_a", "scoring_rate_b",
+    "conceding_rate_a", "conceding_rate_b",
+    "cs_streak_a", "cs_streak_b",
+    "fts_streak_a", "fts_streak_b",
+    "min_scoring_rate", "max_cs_rate",
+    "h2h_btts_rate",
+    "combined_scoring_conceding",
+]
+BTTS_FEATURE_COLUMNS = FEATURE_COLUMNS + BTTS_EXTRA_COLUMNS
+
 
 
 from collections import defaultdict
@@ -121,6 +134,9 @@ def build_features(conn, force_momentum=False):
 
     team_history = defaultdict(list)
     h2h_history = defaultdict(list)
+    # BTTS-specific rolling trackers (10-match window)
+    btts_history = defaultdict(list)  # per team: list of (scored, conceded) booleans
+    h2h_btts_history = defaultdict(list)  # per h2h pair: list of btts booleans
     rows = []
     
     start_idx = min(500, len(matches_df) // 5)
@@ -178,6 +194,43 @@ def build_features(conn, force_momentum=False):
                 form_ga_std_b = float(np.std(ga_vals_b)) if len(ga_vals_b) > 1 else 0.0
                 form_tot_std_b = float(np.std(tot_vals_b)) if len(tot_vals_b) > 1 else 0.0
 
+                def _get_streaks(hist):
+                    cs_strk = 0
+                    fts_strk = 0
+                    for _, _, conceded in reversed(hist):
+                        if not conceded: cs_strk += 1
+                        else: break
+                    for _, scored, _ in reversed(hist):
+                        if not scored: fts_strk += 1
+                        else: break
+                    return cs_strk, fts_strk
+
+                btts_hist_a = btts_history[team_a][-10:]
+                if btts_hist_a:
+                    btts_rate_a = sum(x[0] for x in btts_hist_a) / len(btts_hist_a)
+                    scoring_rate_a = sum(x[1] for x in btts_hist_a) / len(btts_hist_a)
+                    conceding_rate_a = sum(x[2] for x in btts_hist_a) / len(btts_hist_a)
+                    cs_streak_a, fts_streak_a = _get_streaks(btts_hist_a)
+                else:
+                    btts_rate_a = scoring_rate_a = conceding_rate_a = 0.5
+                    cs_streak_a = fts_streak_a = 0
+                    
+                btts_hist_b = btts_history[team_b][-10:]
+                if btts_hist_b:
+                    btts_rate_b = sum(x[0] for x in btts_hist_b) / len(btts_hist_b)
+                    scoring_rate_b = sum(x[1] for x in btts_hist_b) / len(btts_hist_b)
+                    conceding_rate_b = sum(x[2] for x in btts_hist_b) / len(btts_hist_b)
+                    cs_streak_b, fts_streak_b = _get_streaks(btts_hist_b)
+                else:
+                    btts_rate_b = scoring_rate_b = conceding_rate_b = 0.5
+                    cs_streak_b = fts_streak_b = 0
+                
+                h2h_btts_hist = h2h_btts_history[h2h_key][-10:]
+                h2h_btts_rate = sum(h2h_btts_hist) / len(h2h_btts_hist) if h2h_btts_hist else 0.5
+                
+                min_scoring_rate = min(scoring_rate_a, scoring_rate_b)
+                max_cs_rate = max(cs_rate_a, cs_rate_b)
+                combined_scoring_conceding = (scoring_rate_a * conceding_rate_b) * (scoring_rate_b * conceding_rate_a)
 
                 h2h_key = tuple(sorted([team_a, team_b]))
                 h2h_hist = h2h_history[h2h_key]
@@ -284,6 +337,21 @@ def build_features(conn, force_momentum=False):
                     "btts": 1 if int(score_a) > 0 and int(score_b) > 0 else 0,
                     "goes_to_et": 1 if int(score_a) == int(score_b) else 0,
                     "advance_target": 1 if row.get("advance_team") == team_a else (0 if row.get("advance_team") == team_b else None),
+                    # BTTS Specific Features
+                    "btts_rate_a": btts_rate_a,
+                    "btts_rate_b": btts_rate_b,
+                    "scoring_rate_a": scoring_rate_a,
+                    "scoring_rate_b": scoring_rate_b,
+                    "conceding_rate_a": conceding_rate_a,
+                    "conceding_rate_b": conceding_rate_b,
+                    "cs_streak_a": cs_streak_a,
+                    "cs_streak_b": cs_streak_b,
+                    "fts_streak_a": fts_streak_a,
+                    "fts_streak_b": fts_streak_b,
+                    "min_scoring_rate": min_scoring_rate,
+                    "max_cs_rate": max_cs_rate,
+                    "h2h_btts_rate": h2h_btts_rate,
+                    "combined_scoring_conceding": combined_scoring_conceding,
                 }
                 # Binary Over targets for direct classification
                 for thresh in XGB_OVER_THRESHOLDS:
@@ -311,6 +379,12 @@ def build_features(conn, force_momentum=False):
         team_history[team_b].append((match_date, score_b, score_a))
         h2h_key = tuple(sorted([team_a, team_b]))
         h2h_history[h2h_key].append((team_a, score_a, score_b))
+        
+        # Update BTTS history
+        btts_val = 1 if int(score_a) > 0 and int(score_b) > 0 else 0
+        btts_history[team_a].append((btts_val, int(score_a) > 0, int(score_b) > 0))
+        btts_history[team_b].append((btts_val, int(score_b) > 0, int(score_a) > 0))
+        h2h_btts_history[h2h_key].append(btts_val)
         
     return pd.DataFrame(rows)
 
@@ -403,10 +477,12 @@ def train_xgb(conn, force=False):
     print(f"   ✓  {len(df):,} samples built ({len(FEATURE_COLUMNS)} features)")
 
     X = df[FEATURE_COLUMNS].values
+    X_btts = df[BTTS_FEATURE_COLUMNS].values
     y_btts = df["btts"].values
 
     split = int(len(df) * 0.80)
     X_train, X_val = X[:split], X[split:]
+    Xb_train, Xb_val = X_btts[:split], X_btts[split:]
     yb_train, yb_val = y_btts[:split], y_btts[split:]
 
     print("   ⚙  Training XGBoost Market models (5 Over, BTTS + Extra Time)...")
@@ -431,9 +507,9 @@ def train_xgb(conn, force=False):
     # Train BTTS classifier
     btts_params = BTTS_PARAMS.copy()
     model_btts = xgb.XGBClassifier(**btts_params)
-    model_btts.fit(X_train, yb_train, eval_set=[(X_val, yb_val)], verbose=False)
+    model_btts.fit(Xb_train, yb_train, eval_set=[(Xb_val, yb_val)], verbose=False)
 
-    pred_b_proba = model_btts.predict_proba(X_val)[:, 1]
+    pred_b_proba = model_btts.predict_proba(Xb_val)[:, 1]
     btts_logloss = float(log_loss(yb_val, pred_b_proba))
 
     # Train ET classifier on Knockout games only
@@ -460,7 +536,7 @@ def train_xgb(conn, force=False):
     all_importances = np.zeros(len(FEATURE_COLUMNS))
     for m in over_models.values():
         all_importances += m.feature_importances_
-    all_importances += model_btts.feature_importances_
+    all_importances += model_btts.feature_importances_[:len(FEATURE_COLUMNS)]
     if model_et is not None:
         all_importances += model_et.feature_importances_
         all_importances /= (len(over_models) + 2)
@@ -468,6 +544,7 @@ def train_xgb(conn, force=False):
         all_importances /= (len(over_models) + 1)
         
     combined = sorted(zip(FEATURE_COLUMNS, all_importances), key=lambda x: -x[1])
+    btts_specific = sorted(zip(BTTS_EXTRA_COLUMNS, model_btts.feature_importances_[len(FEATURE_COLUMNS):]), key=lambda x: -x[1])
 
     meta = {
         "n_train": len(df),
@@ -642,6 +719,66 @@ def predict_xgb(over_models, model_btts, model_et, form_a, form_b,
     early_sot_a, tempo_var_a = _compute_tempo_features(h_sot_bins)
     early_sot_b, tempo_var_b = _compute_tempo_features(a_sot_bins)
     
+    # --- Live BTTS Features ---
+    btts_rate_a = scoring_rate_a = conceding_rate_a = 0.5
+    cs_streak_a = fts_streak_a = 0
+    btts_rate_b = scoring_rate_b = conceding_rate_b = 0.5
+    cs_streak_b = fts_streak_b = 0
+    h2h_btts_rate = 0.5
+    
+    if conn and team_a and team_b:
+        try:
+            date_filter = f"AND date < '{match_date}'" if match_date else ""
+            
+            def get_btts_hist(team):
+                cur = conn.execute(f"SELECT home_team, home_score, away_score FROM matches WHERE (home_team = ? OR away_team = ?) {date_filter} ORDER BY date DESC LIMIT 10", (team, team))
+                hist = []
+                for ht, hs, as_ in reversed(cur.fetchall()):
+                    hs, as_ = int(hs), int(as_)
+                    is_h = (ht == team)
+                    scored = hs > 0 if is_h else as_ > 0
+                    conceded = as_ > 0 if is_h else hs > 0
+                    btts = 1 if hs > 0 and as_ > 0 else 0
+                    hist.append((btts, scored, conceded))
+                return hist
+
+            def _get_streaks(hist):
+                cs_strk, fts_strk = 0, 0
+                for _, _, conceded in reversed(hist):
+                    if not conceded: cs_strk += 1
+                    else: break
+                for _, scored, _ in reversed(hist):
+                    if not scored: fts_strk += 1
+                    else: break
+                return cs_strk, fts_strk
+                
+            hist_a = get_btts_hist(team_a)
+            if hist_a:
+                btts_rate_a = sum(x[0] for x in hist_a) / len(hist_a)
+                scoring_rate_a = sum(x[1] for x in hist_a) / len(hist_a)
+                conceding_rate_a = sum(x[2] for x in hist_a) / len(hist_a)
+                cs_streak_a, fts_streak_a = _get_streaks(hist_a)
+                
+            hist_b = get_btts_hist(team_b)
+            if hist_b:
+                btts_rate_b = sum(x[0] for x in hist_b) / len(hist_b)
+                scoring_rate_b = sum(x[1] for x in hist_b) / len(hist_b)
+                conceding_rate_b = sum(x[2] for x in hist_b) / len(hist_b)
+                cs_streak_b, fts_streak_b = _get_streaks(hist_b)
+                
+            cur_h2h = conn.execute(f"SELECT home_score, away_score FROM matches WHERE ((home_team = ? AND away_team = ?) OR (home_team = ? AND away_team = ?)) {date_filter} ORDER BY date DESC LIMIT 10", (team_a, team_b, team_b, team_a))
+            h2h_btts_list = [1 if int(hs) > 0 and int(as_) > 0 else 0 for hs, as_ in cur_h2h.fetchall()]
+            if h2h_btts_list:
+                h2h_btts_rate = sum(h2h_btts_list) / len(h2h_btts_list)
+        except Exception:
+            pass
+            
+    min_scoring_rate = min(scoring_rate_a, scoring_rate_b)
+    max_cs_rate = max(cs_rate_a, cs_rate_b)
+    combined_scoring_conceding = (scoring_rate_a * conceding_rate_b) * (scoring_rate_b * conceding_rate_a)
+    # --------------------------
+
+    
     base_feat = [
         elo_a, elo_b, elo_a - elo_b,
         fifa_pts_a or median, fifa_pts_b or median,
@@ -688,6 +825,18 @@ def predict_xgb(over_models, model_btts, model_et, form_a, form_b,
         base_feat.append(float(a_momentum[i]))
 
     feature_vec = np.array([base_feat])
+    
+    btts_extra = [
+        btts_rate_a, btts_rate_b,
+        scoring_rate_a, scoring_rate_b,
+        conceding_rate_a, conceding_rate_b,
+        cs_streak_a, cs_streak_b,
+        fts_streak_a, fts_streak_b,
+        min_scoring_rate, max_cs_rate,
+        h2h_btts_rate,
+        combined_scoring_conceding,
+    ]
+    btts_feat_vec = np.array([base_feat + btts_extra])
 
     # Direct classification: predict_proba for each threshold
     outcomes = {}
@@ -700,7 +849,7 @@ def predict_xgb(over_models, model_btts, model_et, form_a, form_b,
         outcomes[f"over_{thresh_str}_pct"] = prob * 100
         outcomes[f"under_{thresh_str}_pct"] = (1 - prob) * 100
     
-    btts_yes = float(model_btts.predict_proba(feature_vec)[0, 1])
+    btts_yes = float(model_btts.predict_proba(btts_feat_vec)[0, 1])
     outcomes["btts_yes_pct"] = btts_yes * 100
     outcomes["btts_no_pct"] = (1 - btts_yes) * 100
 

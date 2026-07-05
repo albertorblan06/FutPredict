@@ -20,13 +20,14 @@ FutPredict is built on the philosophy of zero data leakage. Performance metrics 
 | **Knockout "To Qualify" (Advance)** | **86.7%** | *Strict OOS Walk-Forward* (World Cup 2022 & Euro 2024) |
 | **Combined Parlay (1X2 + Totals)** | **66.0%** | Cross-model hedging strategy |
 | **Totals (Over/Under 1.5 & 3.5)** | **64.1%** | Requires `> 61.5%` probability threshold |
-| **Extra Time LogLoss Calibration** | **0.638** | Highly calibrated tail-event detection |
+| **Both Teams To Score (BTTS)** | **LogLoss 0.444** | Dedicated 76-feature tree with class imbalance correction |
+| **Extra Time Calibration** | **LogLoss 0.261** | Highly calibrated tail-event detection |
 
 ### Data Integrity Guarantee
 *   **Walk-Forward Validation:** True time-machine backtesting. Models automatically purge future data, iteratively retrain, and predict unseen tournaments to simulate true live-production performance.
 *   **Bayesian Hyperparameter Auto-Tuning:** Uses Optuna with expanding-window temporal cross-validation to dynamically learn and calibrate tournament weights, Elo K-factors, and time-decay half-lives with zero data leakage.
 *   **Dynamic Elo Engine:** Calculates rolling historical Elo ratings from 1990 to present, replacing static FIFA rankings to accurately map true team strength.
-*   **Dual-Architecture Probability:** The system computes two distinct paradigms (Aggressive Focal Loss vs Conservative Cross-Entropy) and averages them into a Consensus Mean for absolute stability.
+*   **Platt Scaling Calibration:** The deep learning models dynamically learn their own temperature scaling variables (e.g., $T^*=1.47$ for Aggressive, $T^*=1.16$ for Conservative) via L-BFGS optimization to guarantee perfectly calibrated probabilities.
 
 ---
 
@@ -48,10 +49,12 @@ graph TD
     
     F --> G[XGBoost Market Fleet]
     F --> X[Advanced XGBoost Regressors]
+    F --> Z[XGBoost BTTS Engine]
     
     D --> H[1X2 Probabilities]
-    E --> J[xG & Score Matrices]
+    E --> J[Poisson Expected Goals]
     G --> K[Totals & ET Probabilities]
+    Z --> W[BTTS Probabilities]
     P --> Q[Anytime Goalscorer %]
     X --> Y[Corners, Cards, Possession]
     
@@ -63,16 +66,18 @@ graph TD
     M --> N[Final Betting Logic & Report]
     Q --> N
     Y --> N
+    W --> N
 ```
 
 ### 1. The Deep Learning Engine (Dual Siamese LSTMs)
 *   **Aggressive Model (Focal Loss):** Designed to hunt for underdog value. Uses Focal Loss ($\gamma=2.0$) to aggressively penalize the network for ignoring the rare "Draw" outcome.
 *   **Conservative Model (Cross-Entropy):** Optimized for stability and defensive solidity. It strictly favors form, H2H dominance, and foundational strength.
-*   **The Consensus:** The engine crosses both LSTMs to output a highly stable Consensus Mean 1X2 probability.
+*   **The Consensus:** The engine crosses both LSTMs to output a highly stable Consensus Mean 1X2 probability, calibrated with learned Platt Scaling.
 
-### 2. The XGBoost Market Fleet & Meta-Ensemble
-*   **Market Fleet:** A dedicated fleet of binary classification XGBoost trees directly target specific lines (`Over 0.5` through `Over 5.5`, `BTTS`).
-*   **Knockout Meta-Ensemble (`--knockout`):** To accurately predict Extra Time, the engine intercepts the XGBoost Extra Time probability and crosses it with the LSTM Consensus Draw probability in a `60/40` weighted ensemble. This unites the Deep Learning and Tree logic for pinnacle accuracy.
+### 2. The XGBoost Market Fleet & BTTS Engine
+*   **Market Fleet:** A dedicated fleet of binary classification XGBoost trees directly target specific lines (`Over 0.5` through `Over 5.5`).
+*   **Dedicated BTTS Engine:** Evaluates 14 BTTS-specific features (including scoring/conceding rates and streaks) to identify the probability of *both* teams scoring, bypassing the standard "totals" logic.
+*   **Per-Team Expected Goals:** Taps into the Dixon-Coles parameters to map expected goals through a Poisson Distribution, outputting independent team goal metrics and visual comparison bars.
 
 ### 3. Advanced Metrics & Player Modeling (NEW)
 *   **Time-Binned Features:** Advanced XGBoost regressors ingest time-binned match data to accurately forecast **Corners, Cards, Target Shots, and Possession splits**.

@@ -508,11 +508,7 @@ def train_lstm_mdn(conn, force=False):
                     loss = criterion_1x2(logits, outcomes)
                 else:
                     criterion_1x2 = nn.CrossEntropyLoss()
-                    ce_loss = criterion_1x2(logits, outcomes)
-                    # Entropy Minimization to force sharpness
-                    probs = torch.softmax(logits, dim=-1)
-                    entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1).mean()
-                    loss = ce_loss + 0.25 * entropy
+                    loss = criterion_1x2(logits, outcomes)
                 
                 optimizer.zero_grad()
                 loss.backward()
@@ -566,10 +562,7 @@ def train_lstm_mdn(conn, force=False):
                         loss = criterion_1x2(logits, outcomes)
                     else:
                         criterion_1x2 = nn.CrossEntropyLoss()
-                        ce_loss = criterion_1x2(logits, outcomes)
-                        probs = torch.softmax(logits, dim=-1)
-                        entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1).mean()
-                        loss = ce_loss + 0.25 * entropy
+                        loss = criterion_1x2(logits, outcomes)
                         
                     val_loss += loss.item()
                     
@@ -612,12 +605,9 @@ def train_lstm_mdn(conn, force=False):
             model_goals.load_state_dict(best_state_goals)
             model_goals.eval()
             
-        if is_aggressive:
-            learned_temp = _calibrate_temperature(model, val_loader, device)
-            print(f"   ✓  Platt Scaling: learned T* = {learned_temp:.4f}")
-        else:
-            learned_temp = 1.0
-            print("   ✓  Platt Scaling: Skipped (T* = 1.0) for sharp Conservative predictions")
+        learned_temp = _calibrate_temperature(model, val_loader, device)
+        label = "Aggressive" if is_aggressive else "Conservative"
+        print(f"   ✓  Platt Scaling ({label}): learned T* = {learned_temp:.4f}")
         
         meta = {
             "n_train": split,
